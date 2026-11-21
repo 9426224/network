@@ -1,0 +1,53 @@
+name: Mirror signed Headscale entry from Gitee
+
+on:
+  schedule:
+    - cron: '4-59/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: mirror-gitee-entry
+
+jobs:
+  mirror:
+    if: github.repository == '9426224/network' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Fetch and verify entry.hsan
+        env:
+          HS_ENTRY_PUBLISHER_KEY: ${{ vars.HS_ENTRY_PUBLISHER_KEY }}
+          GITEE_ENTRY_URL: ${{ vars.GITEE_ENTRY_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { createPublicKey, verify } from 'node:crypto';
+          import { writeFile } from 'node:fs/promises';
+          const source = new URL(process.env.GITEE_ENTRY_URL);
+          if (source.origin !== 'https://gitee.com') throw new Error('Expected anonymous Gitee Contents API');
+          const response = await fetch(source, { redirect: 'error', signal: AbortSignal.timeout(15000) });
+          if (!response.ok) throw new Error(`Gitee returned HTTP ${response.status}`);
+          const file = await response.json();
+          if (file.type !== 'file' || file.encoding !== 'base64' || typeof file.content !== 'string') {
+            throw new Error('Expected a base64 file from Gitee');
+          }
+          const wire = Buffer.from(file.content, 'base64');
+          if (wire.length < 97 || wire.length > 2145 || !wire.subarray(0, 5).equals(Buffer.from('HSAN\x01'))) {
+            throw new Error('Invalid entry announcement');
+          }
+          const pub = Buffer.from(process.env.HS_ENTRY_PUBLISHER_KEY, 'base64');
+          const key = createPublicKey({ format: 'jwk', key: { kty: 'OKP', crv: 'Ed25519', x: pub.toString('base64url') } });
+          if (!verify(null, wire.subarray(4, -64), key, wire.subarray(-64))) throw new Error('Invalid publisher signature');
+          await writeFile('entry.hsan', wire);
+          NODE
+      - name: Update GitHub copy when the signed bytes change
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- entry.hsan
+          if git diff --cached --quiet -- entry.hsan; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Mirror signed entry from Gitee' -- entry.hsan
+          git push origin HEAD:main
